@@ -45,9 +45,14 @@ public class MarkFloorEleAuto : IExternalCommand
 
                 // 计算基准高程
                 double baseElevation = GetBaseElevation(floor, doc);
+                //需要的是基于0的高程，所以不需要减去基准高程
+                //Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
+                //    pt => pt,
+                //    pt => pt.Z - baseElevation);
+
                 Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
                     pt => pt,
-                    pt => pt.Z - baseElevation);
+                    pt => pt.Z);
 
                 // 按绝对偏差值降序排序，取前4个点
                 var selectedPoints = elevations.OrderByDescending(kv => Math.Abs(kv.Value))

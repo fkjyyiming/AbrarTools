@@ -45,12 +45,14 @@ public class MarkFloorEleSingle : IExternalCommand
             TaskDialog.Show("Error", "Insufficient top surface points found"); // 错误提示改为英文
             return Result.Failed;
         }
+        //需要的是基于0的高程，所以不需要减去基准高程
+        //Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
+        //    pt => pt,
+        //    pt => pt.Z - baseElevation);
 
-        // 计算基准高程（基于关联标高）
-        double baseElevation = GetBaseElevation(floor, doc);
         Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
             pt => pt,
-            pt => pt.Z - baseElevation);
+            pt => pt.Z);
 
         // 按绝对偏差值降序排序，取前4个点
         var selectedPoints = elevations.OrderByDescending(kv => Math.Abs(kv.Value))
