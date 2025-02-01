@@ -7,12 +7,14 @@ ps. **DeepSeek 永远滴神！**
 # 2 功能
 ## 2.1 楼板高程点属性
 项目部分楼板为异形楼板，即通过修改楼板控制点、边形成的不规则楼板。因此像快捷量取各个控制点的高度是比较耗时的工作。  
-![image](https://github.com/user-attachments/assets/f19c5b2a-4015-4d78-8caf-f93a44eab3c6)  
+![image](https://github.com/user-attachments/assets/f19c5b2a-4015-4d78-8caf-f93a44eab3c6)   
+     
 通过开发，将偏离值最大的四个点，以共享参数的值的形式添加到楼板中去，以方便查看。有手动逐个添加，以及自动全部添加两种方法。  
-![image](https://github.com/user-attachments/assets/dfaf47c0-56d3-430d-9886-d66611ef3483)  
+![image](https://github.com/user-attachments/assets/dfaf47c0-56d3-430d-9886-d66611ef3483)   
+     
 添加结果（因为项目都为四边的楼板，对于图示复杂形式，只取偏离值最大的四个点）  
-![image](https://github.com/user-attachments/assets/9867c758-3b5c-4082-87ba-bdb62445a3d4)  
-
+![image](https://github.com/user-attachments/assets/9867c758-3b5c-4082-87ba-bdb62445a3d4)   
+     
 
 练习关键点：
 
