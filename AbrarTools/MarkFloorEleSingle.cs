@@ -12,6 +12,7 @@ public class MarkFloorEleSingle : IExternalCommand
 {
     // 共享参数文件名
     private const string SharedParameterFileName = "Shared Parameters_FloorEvelationPoints.txt";
+    private const double Tolerance = 0.001;
 
     public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
     {
@@ -22,7 +23,7 @@ public class MarkFloorEleSingle : IExternalCommand
         // 选择楼板（使用自定义选择过滤器）
         Reference pickedRef = uiDoc.Selection.PickObject(
             ObjectType.Element,
-            new FloorSelectionFilter(),
+            new FloorFilter(),
             "Select a floor"); // 提示语改为英文
         Floor floor = doc.GetElement(pickedRef) as Floor;
 
@@ -38,216 +39,265 @@ public class MarkFloorEleSingle : IExternalCommand
             return Result.Failed;
         }
 
-        // 获取楼板顶面几何顶点（核心几何处理方法）
-        List<XYZ> slabPoints = GetSlabTopSurfacePoints(floor);
+        // 获取顶面点并处理排序
+        List<XYZ> slabPoints = GetTopSurfacePoints(floor);
         if (slabPoints.Count < 4)
         {
             TaskDialog.Show("Error", "Insufficient top surface points found"); // 错误提示改为英文
             return Result.Failed;
         }
-        //需要的是基于0的高程，所以不需要减去基准高程
-        //Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
-        //    pt => pt,
-        //    pt => pt.Z - baseElevation);
 
-        Dictionary<XYZ, double> elevations = slabPoints.ToDictionary(
-            pt => pt,
-            pt => pt.Z);
-
-        // 按绝对偏差值降序排序，取前4个点
-        var selectedPoints = elevations.OrderByDescending(kv => Math.Abs(kv.Value))
-                                       .Take(4)
-                                       .ToDictionary(kv => kv.Key, kv => kv.Value);
+        // 处理顶点排序
+        List<XYZ> sortedPoints = slabPoints.Count == 4 ?
+            SortQuadPoints(slabPoints) :
+            slabPoints.OrderByDescending(p => p.Z).Take(4).ToList();
 
         // 事务处理：写入参数（关键数据库操作）
         using (Transaction trans = new Transaction(doc, "Set Floor Elevation Parameters"))
         {
             trans.Start();
 
-            for (int i = 0; i < selectedPoints.Count; i++)
+            for (int pointIndex = 0; pointIndex < 4; pointIndex++)
             {
-                string paramName = $"SpotElevation_{i + 1}";
-                double elevationValue = selectedPoints.ElementAt(i).Value;
+                if (pointIndex >= sortedPoints.Count) break;
 
-                // 参数有效性检查
-                Parameter param = floor.LookupParameter(paramName);
-                if (param == null)
-                {
-                    TaskDialog.Show("Error",
-                        $"Parameter {paramName} not found. Check shared parameters."); // 错误提示改为英文
-                    return Result.Failed;
-                }
+                XYZ point = sortedPoints[pointIndex];
+                SetParameters(floor, pointIndex + 1, point);
 
-                // 参数赋值（注意单位处理）
-                if (param.StorageType == StorageType.Double)
-                {
-                    param.Set(elevationValue);
-                }
             }
 
             trans.Commit();
         }
 
-        TaskDialog.Show("Success", "Elevation data written successfully"); // 完成提示改为英文
+        TaskDialog.Show("Success", "Parameters updated successfully");
         return Result.Succeeded;
     }
 
+    #region 核心算法
     /// <summary>
-    /// 选择过滤器实现：仅允许选择楼板元素
-    /// （通过实现ISelectionFilter接口控制选择行为）
+    /// 四点顺时针排序算法（基于顶面边和最高点位置）
     /// </summary>
-    public class FloorSelectionFilter : ISelectionFilter
+    private List<XYZ> SortQuadPoints(List<XYZ> points)
     {
-        public bool AllowElement(Element elem) => elem is Floor;
-        public bool AllowReference(Reference reference, XYZ position) => false;
+        // 1. 获取顶面并按边排序
+        List<XYZ> sortedPoints = SortPointsByEdges(points);
+
+        // 2. 找到最高点及其索引
+        XYZ highestPoint = sortedPoints.OrderByDescending(p => p.Z).First();
+        int highestPointIndex = sortedPoints.IndexOf(highestPoint);
+
+        // 3. 将最高点之前的点移动到列表末尾
+        if (highestPointIndex > 0)
+        {
+            List<XYZ> pointsBeforeHighest = sortedPoints.GetRange(0, highestPointIndex);
+            sortedPoints.RemoveRange(0, highestPointIndex);
+            sortedPoints.AddRange(pointsBeforeHighest);
+        }
+
+        // 4. 分割列表为最高点和剩余点
+        XYZ pH = sortedPoints[0];
+        List<XYZ> list1 = sortedPoints.Skip(1).ToList();
+
+        // 5. 判断顺时针方向并调整剩余点顺序
+        XYZ p1 = list1[0]; // list1 的第一个点
+        XYZ p3 = list1[2]; // list1 的最后一个点
+
+        // 将点投影到XY平面
+        XYZ projected_pH = new XYZ(pH.X, pH.Y, 0);
+        XYZ projected_p1 = new XYZ(p1.X, p1.Y, 0);
+        XYZ projected_p3 = new XYZ(p3.X, p3.Y, 0);
+
+        // 计算向量
+        XYZ v1 = (projected_p1 - projected_pH).Normalize();
+        XYZ v3 = (projected_p3 - projected_pH).Normalize();
+
+        // 判断 v1 到 v3 是否为顺时针方向
+        if (v1.CrossProduct(v3).Z > 0)
+        {
+            list1.Reverse(); // 逆转 list1
+        }
+
+        // 6. 组合结果
+        return new List<XYZ> { pH }.Concat(list1).ToList();
     }
 
     /// <summary>
-    /// 加载共享参数文件并绑定到楼板类别
-    /// （关键参数管理方法，包含以下步骤）：
-    /// 1. 定位共享参数文件
-    /// 2. 临时修改应用程序的共享参数文件路径
-    /// 3. 创建参数绑定
-    /// 4. 恢复原始共享参数文件路径
+    /// 根据顶面的边对点进行排序
     /// </summary>
-    /// <param name="doc">当前Revit文档</param>
-    /// <returns>操作是否成功</returns>
-    private bool LoadSharedParameters(Document doc)
+    private List<XYZ> SortPointsByEdges(List<XYZ> points)
     {
-        // 获取DLL路径并构建共享参数文件路径
-        string dllPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
-        string sharedParamFile = Path.Combine(
-            Path.GetDirectoryName(dllPath),
-            SharedParameterFileName);
+        // 假设 points 列表中的点已经是从 GetTopSurfacePoints 函数获取的顶面点
 
-        if (!File.Exists(sharedParamFile))
+        // 用于存储排序后的点
+        List<XYZ> sortedPoints = new List<XYZ>();
+
+        // 用于存储尚未排序的点
+        List<XYZ> unsortedPoints = new List<XYZ>(points);
+
+        // 随机选择一个起始点，并将其添加到 sortedPoints 列表中
+        XYZ currentPoint = unsortedPoints[0];
+        sortedPoints.Add(currentPoint);
+        unsortedPoints.RemoveAt(0);
+
+        // 循环直到所有点都被排序
+        while (unsortedPoints.Count > 0)
         {
-            TaskDialog.Show("Error",
-                $"Shared parameter file not found: {sharedParamFile}"); // 错误提示改为英文
-            return false;
+            // 找到与当前点最近的点
+            XYZ nextPoint = unsortedPoints.OrderBy(p => p.DistanceTo(currentPoint)).First();
+
+            // 将找到的点添加到 sortedPoints 列表中，并从 unsortedPoints 列表中移除
+            sortedPoints.Add(nextPoint);
+            unsortedPoints.Remove(nextPoint);
+
+            // 更新当前点
+            currentPoint = nextPoint;
         }
 
-        // 备份原始共享参数文件路径（重要：确保环境恢复）
-        string originalSharedParamFile = doc.Application.SharedParametersFilename;
-        doc.Application.SharedParametersFilename = sharedParamFile;
-
-        // 打开参数定义文件（注意：需要有效参数组结构）
-        DefinitionFile defFile = doc.Application.OpenSharedParameterFile();
-        if (defFile == null)
+        // 检查第一个点和最后一个点是否闭合，如果不闭合，则反转列表
+        if (sortedPoints.First().DistanceTo(sortedPoints.Last()) > Tolerance)
         {
-            TaskDialog.Show("Error", "Failed to open shared parameter file"); // 错误提示改为英文
-            return false;
+            sortedPoints.Reverse();
         }
 
-        using (Transaction trans = new Transaction(doc, "Load Shared Parameters"))
-        {
-            trans.Start();
-
-            // 获取参数绑定映射表
-            BindingMap map = doc.ParameterBindings;
-            
-            DefinitionGroup group = defFile.Groups.get_Item("FloorEvelation");
-            if (group == null)
-            {
-                TaskDialog.Show("Error",
-                    "Parameter group 'FloorEvelation' not found"); // 错误提示改为英文
-                return false;
-            }
-
-            // 循环创建四个参数绑定
-            for (int i = 1; i <= 4; i++)
-            {
-                string paramName = $"SpotElevation_{i}";
-                Definition paramDef = group.Definitions.get_Item(paramName);
-                if (paramDef == null)
-                {
-                    TaskDialog.Show("Error",
-                        $"Parameter {paramName} not found"); // 错误提示改为英文
-                    return false;
-                }
-
-                // 检查并创建参数绑定（防止重复绑定），绑定到楼板类别
-                if (!map.Contains(paramDef))
-                {
-                    CategorySet categorySet = new CategorySet();
-                    categorySet.Insert(doc.Settings.Categories.get_Item(
-                        BuiltInCategory.OST_Floors));
-
-                    InstanceBinding binding = new InstanceBinding(categorySet);
-                    map.Insert(paramDef, binding, BuiltInParameterGroup.PG_IDENTITY_DATA);
-                }
-            }
-
-            trans.Commit();
-        }
-
-        // 恢复原始共享参数路径（重要：避免影响其他功能）
-        doc.Application.SharedParametersFilename = originalSharedParamFile;
-
-        return true;
+        return sortedPoints;
     }
+    #endregion
 
+    #region 几何处理
     /// <summary>
-    /// 获取楼板顶面几何顶点（核心几何处理方法）：
-    /// 1. 使用HostObjectUtils获取顶面引用
-    /// 2. 遍历所有顶面几何边
-    /// 3. 通过Tessellate方法获取离散点
-    /// 4. 去重后按Z值排序取最高4个点
+    /// 获取楼板顶面顶点
     /// </summary>
-    /// <param name="floor">目标楼板对象</param>
-    /// <returns>顶面顶点列表（最多4个点）</returns>
-    private List<XYZ> GetSlabTopSurfacePoints(Floor floor)
+    private List<XYZ> GetTopSurfacePoints(Floor floor)
     {
-        List<XYZ> topPoints = new List<XYZ>();
-        IList<Reference> topFaces = HostObjectUtils.GetTopFaces(floor);
-
-        if (topFaces.Count == 0)
+        List<XYZ> points = new List<XYZ>();
+        foreach (Reference faceRef in HostObjectUtils.GetTopFaces(floor))
         {
-            TaskDialog.Show("Error", "No top faces found"); // 错误提示改为英文
-            return topPoints;
-        }
+            Face face = floor.GetGeometryObjectFromReference(faceRef) as Face;
+            if (face == null) continue;
 
-        foreach (Reference topFaceRef in topFaces)
-        {
-            Face topFace = floor.GetGeometryObjectFromReference(topFaceRef) as Face;
-            if (topFace == null) continue;
-
-            // 获取边环集合（通常第一个边环是外边界）
-            EdgeArray edges = topFace.EdgeLoops.get_Item(0);
-            foreach (Edge edge in edges)
+            foreach (EdgeArray loop in face.EdgeLoops)
             {
-                // 离散曲线为点集（精度由Revit内部决定）
-                foreach (XYZ pt in edge.Tessellate())
+                foreach (Edge edge in loop)
                 {
-                    // 去重处理（考虑浮点精度误差）
-                    if (!topPoints.Any(p => p.IsAlmostEqualTo(pt, 0.001)))
+                    foreach (XYZ pt in edge.Tessellate())
                     {
-                        topPoints.Add(pt);
+                        if (!points.Any(p => p.IsAlmostEqualTo(pt, Tolerance)))
+                        {
+                            points.Add(pt);
+                        }
                     }
                 }
             }
         }
+        return points.OrderByDescending(p => p.Z).ToList();
+    }
+    #endregion
 
-        // 按Z值降序排列并取前4个点（适用于大部分常规楼板）
-        return topPoints.OrderByDescending(p => p.Z).Take(4).ToList();
+    #region 参数管理
+    /// <summary>
+    /// 设置参数值
+    /// </summary>
+    private void SetParameters(Floor floor, int index, XYZ point)
+    {
+        // Z值参数（保留原始名称）
+        SetParameterValue(floor, $"SpotElevation_{index}", point.Z);
+
+        // X/Y值参数（新命名规则）
+        SetParameterValue(floor, $"SpotCoordinate_N{index}", point.Y);
+        SetParameterValue(floor, $"SpotCoordinate_E{index}", point.X);
+    }
+
+    private void SetParameterValue(Element elem, string paramName, double value)
+    {
+        Parameter param = elem.LookupParameter(paramName);
+        if (param != null && param.StorageType == StorageType.Double)
+        {
+            param.Set(value);
+        }
     }
 
     /// <summary>
-    /// 获取楼板关联的基准标高高程
-    /// （注意：可能返回0如果标高参数无效）
+    /// 加载共享参数文件
     /// </summary>
-    /// <param name="floor">目标楼板对象</param>
-    /// <param name="doc">当前文档</param>
-    /// <returns>基准高程值（单位：项目单位）</returns>
-    private double GetBaseElevation(Floor floor, Document doc)
+    private bool LoadSharedParameters(Document doc)
     {
-        // 通过"Level"参数获取关联标高
-        Parameter levelParam = floor.LookupParameter("Level");
-        if (levelParam != null && levelParam.AsElementId() != ElementId.InvalidElementId)
+        try
         {
-            Level level = doc.GetElement(levelParam.AsElementId()) as Level;
-            return level?.Elevation ?? 0; // 安全访问操作符
+            string assemblyPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            string paramFile = Path.Combine(Path.GetDirectoryName(assemblyPath), SharedParameterFileName);
+
+            if (!File.Exists(paramFile))
+            {
+                TaskDialog.Show("Error", $"Shared parameter file missing: {paramFile}");
+                return false;
+            }
+
+            // 备份原始参数文件路径
+            string originalParamFile = doc.Application.SharedParametersFilename;
+            doc.Application.SharedParametersFilename = paramFile;
+
+            using (Transaction t = new Transaction(doc, "Load Parameters"))
+            {
+                t.Start();
+
+                BindingMap bindings = doc.ParameterBindings;
+                DefinitionFile file = doc.Application.OpenSharedParameterFile();
+
+                DefinitionGroup group = file.Groups.get_Item("FloorEvelation")
+                    ?? file.Groups.Create("FloorEvelation");
+
+                // 创建所有需要的参数
+                for (int i = 1; i <= 4; i++)
+                {
+                    CreateLengthParameter(group, bindings, doc, $"SpotElevation_{i}");
+
+                }
+                for (int i = 1; i <= 4; i++)
+                {
+                    CreateLengthParameter(group, bindings, doc, $"SpotCoordinate_N{i}");
+                    CreateLengthParameter(group, bindings, doc, $"SpotCoordinate_E{i}");
+
+                }
+
+                t.Commit();
+            }
+
+            // 恢复原始参数文件
+            doc.Application.SharedParametersFilename = originalParamFile;
+            return true;
         }
-        return 0; // 默认返回0，可能需要错误处理
+        catch (Exception ex)
+        {
+            TaskDialog.Show("Parameter Error", $"Failed to load parameters: {ex.Message}");
+            return false;
+        }
     }
+
+    private void CreateLengthParameter(DefinitionGroup group, BindingMap bindings, Document doc, string name)
+    {
+        ExternalDefinitionCreationOptions opt = new ExternalDefinitionCreationOptions(name, SpecTypeId.Length);
+
+        Definition paramDef = group.Definitions.get_Item(name)
+            ?? group.Definitions.Create(opt);
+
+        if (!bindings.Contains(paramDef))
+        {
+            CategorySet categories = new CategorySet();
+            categories.Insert(doc.Settings.Categories.get_Item(BuiltInCategory.OST_Floors));
+            bindings.Insert(paramDef, new InstanceBinding(categories), BuiltInParameterGroup.PG_IDENTITY_DATA);
+        }
+    }
+    #endregion
+
+    #region 辅助类
+    /// <summary>
+    /// 楼板选择过滤器
+    /// </summary>
+    private class FloorFilter : ISelectionFilter
+    {
+        public bool AllowElement(Element elem) => elem is Floor;
+        public bool AllowReference(Reference reference, XYZ position) => false;
+    }
+    #endregion
+
 }
